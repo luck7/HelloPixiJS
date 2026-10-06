@@ -10,10 +10,14 @@
     font-family:"PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
   #game{line-height:0;filter:drop-shadow(0 12px 28px rgba(15,23,42,.22));}
   canvas{border-radius:14px;display:block;}
+  #dropMask{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(37,99,235,.16);
+    border:4px dashed #2563eb;border-radius:18px;z-index:99;color:#1d4ed8;font-size:22px;font-weight:800;pointer-events:none;}
 </style>
 </head>
 <body>
 <div id="game"></div>
+<div id="dropMask">松手即导入数独文件</div>
+<input type="file" id="importFile" accept=".txt,.sudoku,text/plain" style="display:none"/>
 <script src="https://cdn.jsdelivr.net/npm/pixi.js@7.4.2/dist/pixi.min.js"></script>
 <script>
 (function () {
@@ -29,10 +33,13 @@ if (typeof PIXI === 'undefined') {
 const W = 600, H = 910;                 // 逻辑画布尺寸
 const BX = 30, BY = 150;                // 棋盘左上角
 const CELL = 60, BS = 540;              // 单元格边长 / 棋盘边长
+const CAND_SIZE = 14;                   // 候选数字字号
 const FONT = '"PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif';
 
 const C = {
   given: 0x0f172a, user: 0x2563eb, hint: 0x059669, err: 0xdc2626, cand: 0x94a3b8,
+  uniq: 0xb45309, uniqBg: 0xfde68a, uniqLine: 0xf59e0b,    // 隐单：行/列/宫中唯一
+  naked: 0x15803d, nakedBg: 0xbbf7d0, nakedLine: 0x16a34a, // 裸单：本格只剩一个候选
   peer: 0xf1f5f9, same: 0xfef3c7, sel: 0xdbeafe, conflict: 0xfee2e2,
   line: 0xdbe2ea, box: 0x334155, border: 0xcbd5e1, text: 0x334155
 };
@@ -64,7 +71,7 @@ function button(x, y, w, h, label, opts) {
   c.x = x; c.y = y;
   const g = new PIXI.Graphics();
   // 文字用白色填充，通过 tint 变色（避免反复重建文字纹理）
-  const lb = new PIXI.Text(label, { fontFamily: FONT, fontSize: opts.size || 15, fill: 0xffffff, fontWeight: '700' });
+  const lb = new PIXI.Text(label, { fontFamily: FONT, fontSize: opts.size || 13, fill: 0xffffff, fontWeight: '700' });
   lb.anchor.set(0.5); lb.x = w / 2; lb.y = h / 2;
   c.addChild(g, lb);
   c.label = lb;
@@ -230,18 +237,70 @@ function canPlace(p, i, n) {
   for (let a = 0; a < 3; a++) for (let b2 = 0; b2 < 3; b2++) if (p[(br * 3 + a) * 9 + bc * 3 + b2] === n) return false;
   return true;
 }
-function candString(mask) {
-  let s = '';
-  for (let r = 0; r < 3; r++) {
-    let line = '';
-    for (let c = 0; c < 3; c++) { const n = r * 3 + c + 1; line += (mask & (1 << n)) ? String(n) : ' '; }
-    s += line + (r < 2 ? '\n' : '');
-  }
-  return s;
-}
 function fmt(sec) {
   const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
   return (m < 10 ? '0' + m : '' + m) + ':' + (s < 10 ? '0' + s : '' + s);
+}
+function countBits(mask) { let c = 0; while (mask) { mask &= mask - 1; c++; } return c; }
+/** 取掩码中唯一的那个数字（仅当恰好只有 1 位时有效） */
+function onlyBit(mask) { for (let n = 1; n <= 9; n++) if (mask & (1 << n)) return n; return 0; }
+/** 当前盘面编码为 81 位字符串（0 表示空格） */
+function boardCode() { return state.puzzle.map(function (v) { return v ? String(v) : '0'; }).join(''); }
+
+/* ==================== 27 个单元（9 行 + 9 列 + 9 宫） ==================== */
+const UNITS = (function () {
+  const list = [];
+  for (let r = 0; r < 9; r++) list.push(Array.from({ length: 9 }, function (_, c) { return r * 9 + c; }));
+  for (let c = 0; c < 9; c++) list.push(Array.from({ length: 9 }, function (_, r) { return r * 9 + c; }));
+  for (let b = 0; b < 9; b++) {
+    const u = [], br = (b / 3 | 0) * 3, bc = (b % 3) * 3;
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) u.push((br + i) * 9 + bc + j);
+    list.push(u);
+  }
+  return list;
+})();
+
+/**
+ * 隐单（hidden single）：某个候选数字在其所在行/列/宫中只有这一格能放。
+ * 返回每格的位掩码（位 n 表示数字 n 在该格唯一）。
+ */
+function computeUniqueCandidates() {
+  const uniq = new Array(81).fill(0);
+  for (const u of UNITS) {
+    let placed = 0;
+    for (const i of u) if (state.puzzle[i]) placed |= (1 << state.puzzle[i]);
+    for (let n = 1; n <= 9; n++) {
+      if (placed & (1 << n)) continue;          // 该数字在本单元已确定
+      let cnt = 0, cell = -1;
+      for (const i of u) {
+        if (!state.puzzle[i] && (state.cand[i] & (1 << n))) { cnt++; cell = i; if (cnt > 1) break; }
+      }
+      if (cnt === 1) uniq[cell] |= (1 << n);
+    }
+  }
+  state.uniq = uniq;
+  return uniq;
+}
+/**
+ * 裸单（naked single）：某格只剩一个候选数字，可直接填入。
+ * 返回 {mask, count}：mask 为每格裸单的位掩码，count 为裸单总数。
+ */
+function computeNakedSingles() {
+  const mask = new Array(81).fill(0);
+  let count = 0;
+  for (let i = 0; i < 81; i++) {
+    if (state.puzzle[i]) continue;
+    const m = state.cand[i];
+    if (m && countBits(m) === 1) { mask[i] = m; count++; }
+  }
+  state.naked = mask;
+  return { mask: mask, count: count };
+}
+/** 统计隐单标记的个数 */
+function countUniqueBits(uniq) {
+  let cnt = 0;
+  for (let i = 0; i < 81; i++) cnt += countBits(uniq[i]);
+  return cnt;
 }
 
 /* ==================== 游戏状态 ==================== */
@@ -252,6 +311,8 @@ const state = {
   initial: new Array(81).fill(0),
   given: new Array(81).fill(false),
   cand: new Array(81).fill(0),
+  uniq: new Array(81).fill(0),     // 隐单标记（行/列/宫中唯一）
+  naked: new Array(81).fill(0),    // 裸单标记（本格只剩一个候选）
   hintCells: new Set(),
   selected: -1,
   mode: 'normal',               // normal | candidate | custom
@@ -297,22 +358,37 @@ for (let i = 3; i < 9; i += 3) {
 gridG.lineStyle(2.5, C.box, 1).drawRect(1.25, 1.25, BS - 2.5, BS - 2.5);
 
 const numC = new PIXI.Container();
+const uniqHlG = new PIXI.Graphics();   // 隐单底色块（琥珀）
+const nakedHlG = new PIXI.Graphics();  // 裸单底色块（绿色）
 const candC = new PIXI.Container();
 const ovG = new PIXI.Graphics();
-const numText = [], candText = [];
+const numText = [];
+
+/* 候选数字：每格 9 个独立文本，按 3×3 均匀分布在单元格内
+   （数字 n 位于 (n-1)%3 列、(n-1)/3 行，格间距 CELL/3） */
+const candText = [];
 for (let i = 0; i < 81; i++) {
   const r = i / 9 | 0, c = i % 9;
   const t = txt('', 32, 0xffffff, '800');       // 白色 + tint 上色
   t.anchor.set(0.5); t.x = c * CELL + CELL / 2; t.y = r * CELL + CELL / 2 + 1;
   t.visible = false; numC.addChild(t); numText.push(t);
-  const ct = new PIXI.Text('', {
-    fontFamily: '"Courier New",Courier,monospace', fontSize: 13, fill: C.cand,
-    fontWeight: '700', align: 'center', lineHeight: 15
-  });
-  ct.anchor.set(0.5); ct.x = c * CELL + CELL / 2; ct.y = r * CELL + CELL / 2 + 1;
-  ct.visible = false; candC.addChild(ct); candText.push(ct);
+
+  const group = [];
+  for (let n = 1; n <= 9; n++) {
+    const col = (n - 1) % 3, row = (n - 1) / 3 | 0;
+    const ct = new PIXI.Text(String(n), {
+      fontFamily: FONT, fontSize: CAND_SIZE, fill: C.cand, fontWeight: '700'
+    });
+    ct.anchor.set(0.5);
+    ct.x = c * CELL + CELL / 6 + col * (CELL / 3);
+    ct.y = r * CELL + CELL / 6 + row * (CELL / 3);
+    ct.visible = false;
+    candC.addChild(ct);
+    group.push(ct);
+  }
+  candText.push(group);
 }
-boardC.addChild(bgG, hlG, gridG, numC, candC, ovG);
+boardC.addChild(bgG, hlG, gridG, uniqHlG, nakedHlG, numC, candC, ovG);
 boardC.eventMode = 'static';
 boardC.hitArea = new PIXI.Rectangle(0, 0, BS, BS);
 boardC.on('pointerdown', function (e) {
@@ -351,12 +427,12 @@ function showOverlay(t, lines, btnLabel, onBtn) {
   const dim = new PIXI.Graphics();
   dim.beginFill(0x0f172a, 0.6).drawRect(0, 0, W, H).endFill();
   dim.eventMode = 'static';
-  const pw = 460, ph = 60 + lines.length * 26 + 90, px = (W - pw) / 2, py = (H - ph) / 2 - 20;
+  const pw = 470, ph = 56 + lines.length * 26 + 90, px = (W - pw) / 2, py = (H - ph) / 2 - 20;
   const panel = new PIXI.Graphics();
   panel.beginFill(0xffffff).drawRoundedRect(px, py, pw, ph, 16).endFill();
-  const tt = txt(t, 26, 0x0f172a, '800'); tt.anchor.set(0.5, 0); tt.x = W / 2; tt.y = py + 26;
+  const tt = txt(t, 25, 0x0f172a, '800'); tt.anchor.set(0.5, 0); tt.x = W / 2; tt.y = py + 24;
   const bodies = lines.map(function (l, i) {
-    const b = txt(l, 15, 0x475569, '600'); b.anchor.set(0.5, 0); b.x = W / 2; b.y = py + 76 + i * 26; return b;
+    const b = txt(l, 14, 0x475569, '600'); b.anchor.set(0.5, 0); b.x = W / 2; b.y = py + 74 + i * 26; return b;
   });
   const btn = button((W - 170) / 2, py + ph - 66, 170, 46, btnLabel || '知道了', {
     fill: 0x2563eb, border: 0x2563eb, color: 0xffffff, size: 17,
@@ -370,9 +446,11 @@ function showHelp() {
     '规则：每行、每列、每个 3×3 宫内 1-9 各出现一次',
     '出题：简单 / 中等 / 困难 三档随机生成，均保证唯一解',
     '提示：自动补一个空格（绿色数字），可查看次数统计',
-    '候选模式：在空格中做铅笔标记，或一键“自动候选”',
-    '自定义：自己录入题目，系统会校验是否有解后开始',
-    '蓝色=自己填写 · 黑色=题目给定 · 红色=冲突 · 黄色=同行列同数'
+    '候选模式：铅笔标记，或一键“自动候选”',
+    '绿色高亮 = 本格只剩唯一候选（裸单，可直接填入）',
+    '琥珀色高亮 = 该候选在行/列/宫中只此一格（隐单）',
+    '导入：点“导入题目”选文件，或把 .txt 拖到窗口上',
+    '导出：点“导出题目”保存当前盘面，可随时再导入'
   ], '开始游戏');
 }
 
@@ -396,10 +474,18 @@ app.ticker.add(function () {
 });
 
 /* ==================== 渲染 ==================== */
+/** 候选 n 在单元格 i 中的子格中心（3×3 均匀分布） */
+function candCenter(i, n) {
+  return {
+    x: (i % 9) * CELL + CELL / 6 + ((n - 1) % 3) * (CELL / 3),
+    y: (i / 9 | 0) * CELL + CELL / 6 + ((n - 1) / 3 | 0) * (CELL / 3)
+  };
+}
 function render() {
   const p = state.puzzle, isCustom = state.mode === 'custom';
   const conf = computeConflicts(p);
   const sel = state.selected;
+  const showCand = !isCustom;
 
   hlG.clear();
   if (sel >= 0) {
@@ -424,6 +510,7 @@ function render() {
     if (conf[i]) hlG.beginFill(C.conflict).drawRect((i % 9) * CELL, (i / 9 | 0) * CELL, CELL, CELL).endFill();
   }
 
+  // 大数字
   for (let i = 0; i < 81; i++) {
     const t = numText[i], v = p[i];
     if (!v) { t.visible = false; continue; }
@@ -434,12 +521,40 @@ function render() {
     else if (conf[i]) t.tint = C.err;
     else t.tint = C.user;
   }
+
+  // 高亮底色：绿色 = 裸单（本格唯一候选），琥珀色 = 隐单（行/列/宫唯一）
+  uniqHlG.clear(); nakedHlG.clear();
   for (let i = 0; i < 81; i++) {
-    const t = candText[i];
-    const show = !isCustom && !p[i] && state.cand[i] !== 0;
-    if (!show) { t.visible = false; continue; }
-    const s = candString(state.cand[i]); if (t.text !== s) t.text = s;
-    t.visible = true;
+    if (!showCand || p[i]) continue;
+    const m = state.cand[i];
+    if (!m) continue;
+    if (countBits(m) === 1) {
+      const n = onlyBit(m), ctr = candCenter(i, n);
+      nakedHlG.beginFill(C.nakedBg, 0.95).lineStyle(1, C.nakedLine, 1)
+        .drawRoundedRect(ctr.x - CELL / 6 + 2, ctr.y - CELL / 6 + 2, CELL / 3 - 4, CELL / 3 - 4, 4).endFill();
+      continue;                                   // 裸单优先，不再画隐单块
+    }
+    const u = state.uniq[i];
+    for (let n = 1; n <= 9; n++) {
+      if (!(u & (1 << n))) continue;
+      const ctr = candCenter(i, n);
+      uniqHlG.beginFill(C.uniqBg, 0.95).lineStyle(1, C.uniqLine, 1)
+        .drawRoundedRect(ctr.x - CELL / 6 + 2, ctr.y - CELL / 6 + 2, CELL / 3 - 4, CELL / 3 - 4, 4).endFill();
+    }
+  }
+
+  // 候选数字：位置固定在单元格内的 3×3 网格上
+  for (let i = 0; i < 81; i++) {
+    const group = candText[i];
+    const mask = (showCand && !p[i]) ? state.cand[i] : 0;
+    const isNaked = mask && countBits(mask) === 1 ? mask : 0;
+    const u = state.uniq[i] || 0;
+    for (let n = 1; n <= 9; n++) {
+      const t = group[n - 1];
+      const on = (mask & (1 << n)) !== 0;
+      t.visible = on;
+      if (on) t.tint = (isNaked) ? C.naked : ((u & (1 << n)) ? C.uniq : C.cand);
+    }
   }
 
   ovG.clear();
@@ -465,6 +580,8 @@ function startGame(p, sol) {
   state.initial = p.slice();
   state.given = p.map(function (v) { return v !== 0; });
   state.cand = new Array(81).fill(0);
+  state.uniq = new Array(81).fill(0);
+  state.naked = new Array(81).fill(0);
   state.hintCells = new Set();
   state.mode = 'normal';
   state.hints = 0; state.mistakes = 0;
@@ -473,6 +590,11 @@ function startGame(p, sol) {
   state.selected = firstEmpty >= 0 ? firstEmpty : 0;
   refreshButtons();
   render();
+}
+function clearDiffHighlight() {
+  Object.keys(diffBtns).forEach(function (k) {
+    diffBtns[k].paint(0xffffff, C.border, C.text);
+  });
 }
 function newGame(diff) {
   state.difficulty = diff;
@@ -492,6 +614,8 @@ function resetPuzzle() {
   if (state.mode === 'custom') return;
   state.puzzle = state.initial.slice();
   state.cand = new Array(81).fill(0);
+  state.uniq = new Array(81).fill(0);
+  state.naked = new Array(81).fill(0);
   state.hintCells = new Set();
   state.finished = false;
   state.running = state.puzzle.indexOf(0) >= 0;
@@ -504,6 +628,8 @@ function enterCustom() {
   state.puzzle = new Array(81).fill(0);
   state.given = new Array(81).fill(false);
   state.cand = new Array(81).fill(0);
+  state.uniq = new Array(81).fill(0);
+  state.naked = new Array(81).fill(0);
   state.selected = 40;
   state.running = false;
   refreshButtons(); render();
@@ -528,6 +654,8 @@ function startCustomGame() {
   const sol = findSolution(p);
   if (!sol) { flash('该题目无解'); return; }
   backup = null;
+  state.difficulty = '自定义';
+  clearDiffHighlight();
   startGame(p, sol);
   if (n > 1) flash('注意：该题目存在多个解，提示采用其中一个');
 }
@@ -535,12 +663,111 @@ function pastePuzzle() {
   const sample = '530070000600195000098000060800060003400803001700020006060000280000419005000080079';
   const s = prompt('请输入 81 个字符（0 或 . 表示空格），例如：\n' + sample, '');
   if (s == null) return;
-  const digits = (s.match(/\d/g) || []).map(Number);
-  if (digits.length < 81) { flash('识别到 ' + digits.length + ' 个数字，不足 81 个'); return; }
-  state.puzzle = digits.slice(0, 81).map(function (d) { return d >= 1 && d <= 9 ? d : 0; });
-  state.selected = 40;
-  render();
+  const p = parsePuzzleText(s);
+  if (!p) { flash('识别到的数字不足 81 个，导入失败'); return; }
+  loadPuzzle(p);
 }
+
+/* ==================== 导入 / 导出 ==================== */
+const fileInput = document.getElementById('importFile');
+const dropMask = document.getElementById('dropMask');
+
+/** 从任意文本中解析出 81 位盘面：取第一个数字够 81 个的行 */
+function parsePuzzleText(text) {
+  const lines = String(text || '').split(/\r?\n/);
+  for (const raw of lines) {
+    if (raw.trim().charAt(0) === '#') continue;          // 跳过导出的注释行
+    let s = '';
+    for (const ch of raw) {
+      if (ch >= '0' && ch <= '9') s += ch;
+      else if (ch === '.' || ch === '-' || ch === '_') s += '0';
+      if (s.length >= 81) break;
+    }
+    if (s.length >= 81) {
+      return s.slice(0, 81).split('').map(function (ch) {
+        const v = Number(ch); return v >= 1 && v <= 9 ? v : 0;
+      });
+    }
+  }
+  return null;
+}
+
+/** 载入外部盘面：校验后直接开局 */
+function loadPuzzle(p) {
+  const count = p.filter(function (v) { return v !== 0; }).length;
+  if (count < 17) { flash('导入失败：已知数字至少 17 个（当前 ' + count + ' 个）'); return false; }
+  const n = countSolutions(p, 2);
+  if (n === 0) { flash('导入失败：该题目无解，请检查行/列/宫是否有重复'); return false; }
+  const sol = findSolution(p);
+  if (!sol) { flash('导入失败：该题目无解'); return false; }
+  backup = null;
+  state.difficulty = '导入题目';
+  clearDiffHighlight();
+  startGame(p, sol);
+  flash(n > 1 ? '导入成功（该题有多个解，提示采用其中一个）' : '导入成功，共 ' + count + ' 个已知数字');
+  return true;
+}
+
+function importFromFile(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function () {
+    const p = parsePuzzleText(reader.result);
+    if (!p) { flash('文件解析失败：未找到 81 位盘面'); return; }
+    loadPuzzle(p);
+  };
+  reader.onerror = function () { flash('文件读取失败'); };
+  reader.readAsText(file, 'utf-8');
+}
+
+/** 导出当前盘面为文本文件 */
+function exportPuzzle() {
+  if (state.mode === 'custom') { flash('请先点击“开始游戏”再导出'); return; }
+  const code = boardCode();
+  const now = new Date();
+  const pad = function (n) { return n < 10 ? '0' + n : '' + n; };
+  const stamp = now.getFullYear() + pad(now.getMonth() + 1) + pad(now.getDate()) + '-' + pad(now.getHours()) + pad(now.getMinutes());
+  const lines = [
+    '# PixiJS 数独题目（81 位，0 表示空格）',
+    '# 难度: ' + state.difficulty,
+    '# 用时: ' + fmt(state.elapsed) + '   错误: ' + state.mistakes + ' 次   提示: ' + state.hints + ' 次',
+    '# 已知数字: ' + code.split('').filter(function (c) { return c !== '0'; }).length + ' 个',
+    '# 导出时间: ' + stamp,
+    code
+  ];
+  const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'sudoku-' + state.difficulty + '-' + stamp + '.txt';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  flash('已导出题目文件（sudoku-' + state.difficulty + '-' + stamp + '.txt）');
+}
+
+fileInput.addEventListener('change', function () {
+  importFromFile(this.files && this.files[0]);
+  this.value = '';
+});
+['dragenter', 'dragover'].forEach(function (t) {
+  window.addEventListener(t, function (e) {
+    if (!e.dataTransfer) return;
+    e.preventDefault();
+    dropMask.style.display = 'flex';
+  });
+});
+['dragleave', 'drop'].forEach(function (t) {
+  window.addEventListener(t, function (e) {
+    e.preventDefault();
+    if (t === 'dragleave' && e.relatedTarget) return;
+    dropMask.style.display = 'none';
+    if (t === 'drop' && e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]) {
+      importFromFile(e.dataTransfer.files[0]);
+    }
+  });
+});
 
 /* ==================== 交互动作 ==================== */
 function pressNumber(n) {
@@ -555,6 +782,7 @@ function pressNumber(n) {
   if (state.mode === 'candidate') {
     if (state.puzzle[i] !== 0) { flash('该格已填数字，先擦除才能标记候选'); return; }
     state.cand[i] ^= (1 << n);
+    computeUniqueCandidates();       // 候选变化后重算隐单标记
     render(); return;
   }
   if (state.puzzle[i] === n) { state.puzzle[i] = 0; render(); return; }
@@ -562,6 +790,7 @@ function pressNumber(n) {
   state.cand[i] = 0;
   state.hintCells.delete(i);
   removePeerCandidates(i, n);
+  computeUniqueCandidates();
   if (n !== state.solution[i]) state.mistakes++;
   render();
   checkWin();
@@ -573,6 +802,7 @@ function eraseCell() {
   if (state.mode === 'custom') { state.puzzle[i] = 0; render(); return; }
   if (state.given[i]) { flash('题目给出的数字不能擦除'); return; }
   state.puzzle[i] = 0; state.cand[i] = 0; state.hintCells.delete(i);
+  computeUniqueCandidates();
   render();
 }
 function removePeerCandidates(i, n) {
@@ -596,7 +826,14 @@ function autoCandidates() {
     for (let n = 1; n <= 9; n++) if (canPlace(state.puzzle, i, n)) mask |= (1 << n);
     state.cand[i] = mask;
   }
-  flash('已为所有空格填充可能项');
+  const naked = computeNakedSingles();          // 裸单：本格只剩一个候选
+  const uniq = computeUniqueCandidates();        // 隐单：行/列/宫中唯一
+  const h = countUniqueBits(uniq);
+  let msg = '已填充可能项';
+  if (naked.count) msg += ' · 裸单 ' + naked.count + ' 个（绿色，可直接填入）';
+  if (h) msg += ' · 隐单 ' + h + ' 个（琥珀色）';
+  if (!naked.count && !h) msg += '，暂无唯一候选';
+  flash(msg);
   render();
 }
 function hint() {
@@ -616,6 +853,7 @@ function hint() {
   state.hints++;
   state.selected = i;
   removePeerCandidates(i, n);
+  computeUniqueCandidates();
   render();
   checkWin();
 }
@@ -650,13 +888,15 @@ function refreshButtons() {
         }
       },
       { label: '自动候选', opts: { onTap: autoCandidates } },
-      { label: '清除候选', opts: { onTap: function () { state.cand = new Array(81).fill(0); render(); } } },
+      { label: '清除候选', opts: { onTap: function () { state.cand = new Array(81).fill(0); state.uniq = new Array(81).fill(0); state.naked = new Array(81).fill(0); render(); } } },
       { label: '擦除', opts: { onTap: eraseCell } }
     ]);
   }
   buildRow(row2, 830, [
-    { label: '新游戏', opts: { fill: 0x0ea5e9, border: 0x0ea5e9, color: 0xffffff, onTap: function () { newGame(state.difficulty); } } },
+    { label: '新游戏', opts: { fill: 0x0ea5e9, border: 0x0ea5e9, color: 0xffffff, size: 15, onTap: function () { newGame(state.difficulty); } } },
     { label: '自定义题目', opts: { onTap: enterCustom } },
+    { label: '导入题目', opts: { fill: 0x8b5cf6, border: 0x8b5cf6, color: 0xffffff, onTap: function () { fileInput.click(); } } },
+    { label: '导出题目', opts: { fill: 0x14b8a6, border: 0x14b8a6, color: 0xffffff, onTap: exportPuzzle } },
     { label: '重置本题', opts: { onTap: resetPuzzle } },
     { label: '帮助', opts: { onTap: showHelp } }
   ]);
