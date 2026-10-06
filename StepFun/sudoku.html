@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"/>
+<title>PixiJS 数独</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;height:100%;background:#e7ecf3;display:flex;align-items:center;justify-content:center;overflow:hidden;
+    font-family:"PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
+  #game{line-height:0;filter:drop-shadow(0 12px 28px rgba(15,23,42,.22));}
+  canvas{border-radius:14px;display:block;}
+</style>
+</head>
+<body>
+<div id="game"></div>
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@7.4.2/dist/pixi.min.js"></script>
+<script>
+(function () {
+'use strict';
+
+if (typeof PIXI === 'undefined') {
+  document.getElementById('game').innerHTML =
+    '<div style="font-family:sans-serif;padding:24px">PixiJS 加载失败：请联网后刷新（CDN: jsdelivr）。</div>';
+  return;
+}
+
+/* ==================== 布局常量 ==================== */
+const W = 600, H = 910;                 // 逻辑画布尺寸
+const BX = 30, BY = 150;                // 棋盘左上角
+const CELL = 60, BS = 540;              // 单元格边长 / 棋盘边长
+const FONT = '"PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif';
+
+const C = {
+  given: 0x0f172a, user: 0x2563eb, hint: 0x059669, err: 0xdc2626, cand: 0x94a3b8,
+  peer: 0xf1f5f9, same: 0xfef3c7, sel: 0xdbeafe, conflict: 0xfee2e2,
+  line: 0xdbe2ea, box: 0x334155, border: 0xcbd5e1, text: 0x334155
+};
+
+const app = new PIXI.Application({
+  width: W, height: H, antialias: true, backgroundColor: 0xeef2f7,
+  resolution: Math.min(window.devicePixelRatio || 1, 2), autoDensity: true
+});
+const view = app.view;
+view.style.touchAction = 'none';
+document.getElementById('game').appendChild(view);
+
+function fit() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  view.style.width = Math.floor(W * s) + 'px';
+  view.style.height = Math.floor(H * s) + 'px';
+}
+window.addEventListener('resize', fit); fit();
+
+/* ==================== 通用绘图helper ==================== */
+function txt(str, size, fill, weight) {
+  return new PIXI.Text(str, { fontFamily: FONT, fontSize: size, fill: fill, fontWeight: weight || '700' });
+}
+
+/** 创建一个可点击按钮容器 */
+function button(x, y, w, h, label, opts) {
+  opts = opts || {};
+  const c = new PIXI.Container();
+  c.x = x; c.y = y;
+  const g = new PIXI.Graphics();
+  // 文字用白色填充，通过 tint 变色（避免反复重建文字纹理）
+  const lb = new PIXI.Text(label, { fontFamily: FONT, fontSize: opts.size || 15, fill: 0xffffff, fontWeight: '700' });
+  lb.anchor.set(0.5); lb.x = w / 2; lb.y = h / 2;
+  c.addChild(g, lb);
+  c.label = lb;
+  c.paint = function (fill, border, tcol) {
+    g.clear();
+    g.beginFill(fill); g.lineStyle(1.5, border);
+    g.drawRoundedRect(0.75, 0.75, w - 1.5, h - 1.5, 10); g.endFill();
+    lb.tint = tcol;
+  };
+  c.paint(opts.fill || 0xffffff, opts.border || C.border, opts.color || C.text);
+  c.eventMode = 'static'; c.cursor = 'pointer';
+  c.hitArea = new PIXI.Rectangle(0, 0, w, h);
+  c.on('pointertap', function (e) { if (e.stopPropagation) e.stopPropagation(); if (!c.disabled && opts.onTap) opts.onTap(); });
+  c.on('pointerover', function () { if (!c.disabled) c.alpha = 0.86; });
+  c.on('pointerout', function () { c.alpha = 1; });
+  return c;
+}
+
+/** 在一行内自动等宽排布按钮 */
+function buildRow(container, y, items, h) {
+  container.removeChildren().forEach(function (ch) { ch.destroy({ children: true }); });
+  const n = items.length, gap = 8, w = (BS - gap * (n - 1)) / n;
+  items.forEach(function (it, idx) {
+    const b = button(BX + idx * (w + gap), y, w, h || 44, it.label, it.opts || {});
+    container.addChild(b);
+    if (it.ref) it.ref(b);
+  });
+}
+
+/* ==================== 数独核心算法 ==================== */
+function shuffled(a) {
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.random() * (i + 1) | 0; const t = a[i]; a[i] = a[j]; a[j] = t; }
+  return a;
+}
+function isSafe(b, r, c, n) {
+  for (let k = 0; k < 9; k++) { if (b[r * 9 + k] === n) return false; if (b[k * 9 + c] === n) return false; }
+  const br = r - r % 3, bc = c - c % 3;
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) if (b[(br + i) * 9 + bc + j] === n) return false;
+  return true;
+}
+/** 随机生成一个完整合法终盘 */
+function generateSolution() {
+  const b = new Array(81).fill(0);
+  (function fill(pos) {
+    if (pos === 81) return true;
+    const r = pos / 9 | 0, c = pos % 9;
+    const ns = shuffled([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    for (const n of ns) {
+      if (isSafe(b, r, c, n)) { b[pos] = n; if (fill(pos + 1)) return true; b[pos] = 0; }
+    }
+    return false;
+  })(0);
+  return b;
+}
+/** 统计解的数量（最多数到 limit 个），用于保证题目唯一解 */
+function countSolutions(board, limit) {
+  const b = board.slice();
+  const rows = new Array(9).fill(0), cols = new Array(9).fill(0), boxes = new Array(9).fill(0), empties = [];
+  for (let i = 0; i < 81; i++) {
+    const v = b[i], r = i / 9 | 0, c = i % 9, k = (r / 3 | 0) * 3 + (c / 3 | 0);
+    if (v) {
+      const m = 1 << v;
+      if ((rows[r] & m) || (cols[c] & m) || (boxes[k] & m)) return 0;
+      rows[r] |= m; cols[c] |= m; boxes[k] |= m;
+    } else empties.push(i);
+  }
+  let count = 0;
+  const rec = function () {
+    if (count >= limit) return;
+    let best = -1, bestMask = 0, bestCount = 10;
+    for (const i of empties) {
+      if (b[i]) continue;
+      const r = i / 9 | 0, c = i % 9, k = (r / 3 | 0) * 3 + (c / 3 | 0);
+      const used = rows[r] | cols[c] | boxes[k];
+      let cnt = 0, mask = 0;
+      for (let n = 1; n <= 9; n++) { const m = 1 << n; if (!(used & m)) { cnt++; mask |= m; } }
+      if (cnt === 0) return;
+      if (cnt < bestCount) { bestCount = cnt; best = i; bestMask = mask; if (cnt === 1) break; }
+    }
+    if (best < 0) { count++; return; }
+    const r = best / 9 | 0, c = best % 9, k = (r / 3 | 0) * 3 + (c / 3 | 0);
+    for (let n = 1; n <= 9; n++) {
+      const m = 1 << n;
+      if (bestMask & m) {
+        b[best] = n; rows[r] |= m; cols[c] |= m; boxes[k] |= m;
+        rec();
+        b[best] = 0; rows[r] &= ~m; cols[c] &= ~m; boxes[k] &= ~m;
+        if (count >= limit) return;
+      }
+    }
+  };
+  rec();
+  return count;
+}
+/** 求任意一个解 */
+function findSolution(board) {
+  const b = board.slice();
+  const rows = new Array(9).fill(0), cols = new Array(9).fill(0), boxes = new Array(9).fill(0), empties = [];
+  for (let i = 0; i < 81; i++) {
+    const v = b[i], r = i / 9 | 0, c = i % 9, k = (r / 3 | 0) * 3 + (c / 3 | 0);
+    if (v) { const m = 1 << v; if ((rows[r] & m) || (cols[c] & m) || (boxes[k] & m)) return null; rows[r] |= m; cols[c] |= m; boxes[k] |= m; }
+    else empties.push(i);
+  }
+  const rec = function () {
+    let best = -1, bestMask = 0, bestCount = 10;
+    for (const i of empties) {
+      if (b[i]) continue;
+      const r = i / 9 | 0, c = i % 9, k = (r / 3 | 0) * 3 + (c / 3 | 0);
+      const used = rows[r] | cols[c] | boxes[k];
+      let cnt = 0, mask = 0;
+      for (let n = 1; n <= 9; n++) { const m = 1 << n; if (!(used & m)) { cnt++; mask |= m; } }
+      if (cnt === 0) return false;
+      if (cnt < bestCount) { bestCount = cnt; best = i; bestMask = mask; if (cnt === 1) break; }
+    }
+    if (best < 0) return true;
+    const r = best / 9 | 0, c = best % 9, k = (r / 3 | 0) * 3 + (c / 3 | 0);
+    for (let n = 1; n <= 9; n++) {
+      const m = 1 << n;
+      if (bestMask & m) {
+        b[best] = n; rows[r] |= m; cols[c] |= m; boxes[k] |= m;
+        if (rec()) return true;
+        b[best] = 0; rows[r] &= ~m; cols[c] &= ~m; boxes[k] &= ~m;
+      }
+    }
+    return false;
+  };
+  return rec() ? b : null;
+}
+/** 按难度挖空，保证唯一解 */
+function makePuzzle(clues) {
+  const sol = generateSolution();
+  const puzzle = sol.slice();
+  const order = shuffled(Array.from({ length: 81 }, function (_, i) { return i; }));
+  const target = 81 - clues;
+  let removed = 0;
+  for (const i of order) {
+    if (removed >= target) break;
+    const backup = puzzle[i];
+    puzzle[i] = 0;
+    if (countSolutions(puzzle, 2) !== 1) puzzle[i] = backup;
+    else removed++;
+  }
+  return { puzzle: puzzle, solution: sol };
+}
+function computeConflicts(p) {
+  const conf = new Array(81).fill(false);
+  for (let i = 0; i < 81; i++) {
+    const v = p[i]; if (!v) continue;
+    const r = i / 9 | 0, c = i % 9, br = r / 3 | 0, bc = c / 3 | 0;
+    for (let j = 0; j < 81; j++) {
+      if (j === i || p[j] !== v) continue;
+      const rr = j / 9 | 0, cc = j % 9;
+      if (rr === r || cc === c || ((rr / 3 | 0) === br && (cc / 3 | 0) === bc)) { conf[i] = true; break; }
+    }
+  }
+  return conf;
+}
+function canPlace(p, i, n) {
+  const r = i / 9 | 0, c = i % 9, br = r / 3 | 0, bc = c / 3 | 0;
+  for (let k = 0; k < 9; k++) {
+    if (p[r * 9 + k] === n || p[k * 9 + c] === n) return false;
+  }
+  for (let a = 0; a < 3; a++) for (let b2 = 0; b2 < 3; b2++) if (p[(br * 3 + a) * 9 + bc * 3 + b2] === n) return false;
+  return true;
+}
+function candString(mask) {
+  let s = '';
+  for (let r = 0; r < 3; r++) {
+    let line = '';
+    for (let c = 0; c < 3; c++) { const n = r * 3 + c + 1; line += (mask & (1 << n)) ? String(n) : ' '; }
+    s += line + (r < 2 ? '\n' : '');
+  }
+  return s;
+}
+function fmt(sec) {
+  const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+  return (m < 10 ? '0' + m : '' + m) + ':' + (s < 10 ? '0' + s : '' + s);
+}
+
+/* ==================== 游戏状态 ==================== */
+const DIFF_CLUES = { '简单': 42, '中等': 33, '困难': 27 };
+const state = {
+  puzzle: new Array(81).fill(0),
+  solution: new Array(81).fill(0),
+  initial: new Array(81).fill(0),
+  given: new Array(81).fill(false),
+  cand: new Array(81).fill(0),
+  hintCells: new Set(),
+  selected: -1,
+  mode: 'normal',               // normal | candidate | custom
+  difficulty: '中等',
+  hints: 0, mistakes: 0,
+  elapsed: 0, running: false, finished: false
+};
+let backup = null;              // 进入自定义前的棋盘备份
+
+/* ==================== 静态界面 ==================== */
+const title = txt('数 独', 30, 0x0f172a, '800'); title.x = 30; title.y = 18;
+const sub = txt('PixiJS Sudoku', 14, 0x64748b, '600'); sub.anchor.set(1, 0); sub.x = 570; sub.y = 32;
+const statusL = txt('', 14, 0x475569, '600'); statusL.x = 30; statusL.y = 112;
+const statusR = txt('', 14, 0x475569, '600'); statusR.anchor.set(1, 0); statusR.x = 570; statusR.y = 112;
+app.stage.addChild(title, sub, statusL, statusR);
+
+const diffBtns = {};
+[['简单', 0], ['中等', 1], ['困难', 2]].forEach(function (d) {
+  const w = (BS - 8 * 2) / 3;
+  const b = button(BX + d[1] * (w + 8), 64, w, 38, d[0], {
+    size: 16,
+    onTap: function () { newGame(d[0]); }
+  });
+  diffBtns[d[0]] = b;
+  app.stage.addChild(b);
+});
+
+/* --- 棋盘 --- */
+const boardC = new PIXI.Container(); boardC.x = BX; boardC.y = BY;
+const bgG = new PIXI.Graphics();
+bgG.beginFill(0xffffff).drawRect(0, 0, BS, BS).endFill();
+const hlG = new PIXI.Graphics();
+const gridG = new PIXI.Graphics();
+gridG.lineStyle(1, C.line, 1);
+for (let i = 1; i < 9; i++) {
+  if (i % 3 === 0) continue;
+  gridG.moveTo(i * CELL, 0).lineTo(i * CELL, BS).moveTo(0, i * CELL).lineTo(BS, i * CELL);
+}
+gridG.lineStyle(2.5, C.box, 1);
+for (let i = 3; i < 9; i += 3) {
+  gridG.moveTo(i * CELL, 0).lineTo(i * CELL, BS).moveTo(0, i * CELL).lineTo(BS, i * CELL);
+}
+gridG.lineStyle(2.5, C.box, 1).drawRect(1.25, 1.25, BS - 2.5, BS - 2.5);
+
+const numC = new PIXI.Container();
+const candC = new PIXI.Container();
+const ovG = new PIXI.Graphics();
+const numText = [], candText = [];
+for (let i = 0; i < 81; i++) {
+  const r = i / 9 | 0, c = i % 9;
+  const t = txt('', 32, 0xffffff, '800');       // 白色 + tint 上色
+  t.anchor.set(0.5); t.x = c * CELL + CELL / 2; t.y = r * CELL + CELL / 2 + 1;
+  t.visible = false; numC.addChild(t); numText.push(t);
+  const ct = new PIXI.Text('', {
+    fontFamily: '"Courier New",Courier,monospace', fontSize: 13, fill: C.cand,
+    fontWeight: '700', align: 'center', lineHeight: 15
+  });
+  ct.anchor.set(0.5); ct.x = c * CELL + CELL / 2; ct.y = r * CELL + CELL / 2 + 1;
+  ct.visible = false; candC.addChild(ct); candText.push(ct);
+}
+boardC.addChild(bgG, hlG, gridG, numC, candC, ovG);
+boardC.eventMode = 'static';
+boardC.hitArea = new PIXI.Rectangle(0, 0, BS, BS);
+boardC.on('pointerdown', function (e) {
+  const p = e.data.getLocalPosition(boardC);
+  const c = Math.floor(p.x / CELL), r = Math.floor(p.y / CELL);
+  if (r < 0 || r > 8 || c < 0 || c > 8) return;
+  state.selected = r * 9 + c;
+  render();
+});
+app.stage.addChild(boardC);
+
+/* --- 数字键盘 --- */
+const padBtns = {};
+const padC = new PIXI.Container(); padC.y = 706; app.stage.addChild(padC);
+for (let n = 1; n <= 9; n++) {
+  const b = button(BX + (n - 1) * CELL + 2, 0, CELL - 4, 58, String(n), {
+    size: 26, fill: 0xffffff, border: 0xcbd5e1, color: 0x1e293b,
+    onTap: function () { pressNumber(n); }
+  });
+  padBtns[n] = b; padC.addChild(b);
+}
+
+/* --- 功能按钮行 --- */
+const row1 = new PIXI.Container(); app.stage.addChild(row1);
+const row2 = new PIXI.Container(); app.stage.addChild(row2);
+
+const tip = txt('快捷键：1-9 填入 · 0/Delete 擦除 · 方向键移动 · C 候选模式 · H 提示 · Esc 关闭弹窗', 12, 0x94a3b8, '600');
+tip.anchor.set(0.5, 0); tip.x = W / 2; tip.y = 888; app.stage.addChild(tip);
+
+/* --- 弹窗 --- */
+const overlayC = new PIXI.Container(); overlayC.visible = false; app.stage.addChild(overlayC);
+let overlayVisible = false;
+function hideOverlay() { overlayC.visible = false; overlayVisible = false; }
+function showOverlay(t, lines, btnLabel, onBtn) {
+  overlayC.removeChildren().forEach(function (ch) { ch.destroy({ children: true }); });
+  const dim = new PIXI.Graphics();
+  dim.beginFill(0x0f172a, 0.6).drawRect(0, 0, W, H).endFill();
+  dim.eventMode = 'static';
+  const pw = 460, ph = 60 + lines.length * 26 + 90, px = (W - pw) / 2, py = (H - ph) / 2 - 20;
+  const panel = new PIXI.Graphics();
+  panel.beginFill(0xffffff).drawRoundedRect(px, py, pw, ph, 16).endFill();
+  const tt = txt(t, 26, 0x0f172a, '800'); tt.anchor.set(0.5, 0); tt.x = W / 2; tt.y = py + 26;
+  const bodies = lines.map(function (l, i) {
+    const b = txt(l, 15, 0x475569, '600'); b.anchor.set(0.5, 0); b.x = W / 2; b.y = py + 76 + i * 26; return b;
+  });
+  const btn = button((W - 170) / 2, py + ph - 66, 170, 46, btnLabel || '知道了', {
+    fill: 0x2563eb, border: 0x2563eb, color: 0xffffff, size: 17,
+    onTap: function () { hideOverlay(); if (onBtn) onBtn(); }
+  });
+  overlayC.addChild(dim, panel, tt); bodies.forEach(function (b) { overlayC.addChild(b); }); overlayC.addChild(btn);
+  overlayC.visible = true; overlayVisible = true;
+}
+function showHelp() {
+  showOverlay('玩法与功能', [
+    '规则：每行、每列、每个 3×3 宫内 1-9 各出现一次',
+    '出题：简单 / 中等 / 困难 三档随机生成，均保证唯一解',
+    '提示：自动补一个空格（绿色数字），可查看次数统计',
+    '候选模式：在空格中做铅笔标记，或一键“自动候选”',
+    '自定义：自己录入题目，系统会校验是否有解后开始',
+    '蓝色=自己填写 · 黑色=题目给定 · 红色=冲突 · 黄色=同行列同数'
+  ], '开始游戏');
+}
+
+/* ==================== 状态提示 ==================== */
+let flashMsg = '', flashUntil = 0;
+function flash(m) { flashMsg = m; flashUntil = performance.now() + 2400; }
+function baseStatus() {
+  if (state.mode === 'custom') return '自定义模式：录入已知数字（≥17 个）→ 点“开始游戏”';
+  if (state.mode === 'candidate') return '候选模式：点击数字进行标记 / 取消标记';
+  return '点击格子，再用数字键盘或键盘 1-9 填入';
+}
+function updateStatus() {
+  const left = performance.now() < flashUntil ? flashMsg : baseStatus();
+  if (statusL.text !== left) { statusL.text = left; statusL.tint = performance.now() < flashUntil ? 0xdc2626 : 0x475569; }
+  const right = fmt(state.elapsed) + ' · 错误 ' + state.mistakes + ' · 提示 ' + state.hints;
+  if (statusR.text !== right) statusR.text = right;
+}
+app.ticker.add(function () {
+  if (state.running && !state.finished) state.elapsed += app.ticker.deltaMS / 1000;
+  updateStatus();
+});
+
+/* ==================== 渲染 ==================== */
+function render() {
+  const p = state.puzzle, isCustom = state.mode === 'custom';
+  const conf = computeConflicts(p);
+  const sel = state.selected;
+
+  hlG.clear();
+  if (sel >= 0) {
+    const r = sel / 9 | 0, c = sel % 9, br = r / 3 | 0, bc = c / 3 | 0;
+    for (let i = 0; i < 81; i++) {
+      if (i === sel) continue;
+      const rr = i / 9 | 0, cc = i % 9;
+      if (rr === r || cc === c || ((rr / 3 | 0) === br && (cc / 3 | 0) === bc)) {
+        hlG.beginFill(C.peer).drawRect(cc * CELL, rr * CELL, CELL, CELL).endFill();
+      }
+    }
+    if (p[sel]) {
+      for (let i = 0; i < 81; i++) {
+        if (i !== sel && p[i] === p[sel]) {
+          hlG.beginFill(C.same).drawRect((i % 9) * CELL, (i / 9 | 0) * CELL, CELL, CELL).endFill();
+        }
+      }
+    }
+    hlG.beginFill(C.sel).drawRect(c * CELL, r * CELL, CELL, CELL).endFill();
+  }
+  for (let i = 0; i < 81; i++) {
+    if (conf[i]) hlG.beginFill(C.conflict).drawRect((i % 9) * CELL, (i / 9 | 0) * CELL, CELL, CELL).endFill();
+  }
+
+  for (let i = 0; i < 81; i++) {
+    const t = numText[i], v = p[i];
+    if (!v) { t.visible = false; continue; }
+    const s = String(v); if (t.text !== s) t.text = s;
+    t.visible = true;
+    if (isCustom || state.given[i]) t.tint = C.given;
+    else if (state.hintCells.has(i)) t.tint = C.hint;
+    else if (conf[i]) t.tint = C.err;
+    else t.tint = C.user;
+  }
+  for (let i = 0; i < 81; i++) {
+    const t = candText[i];
+    const show = !isCustom && !p[i] && state.cand[i] !== 0;
+    if (!show) { t.visible = false; continue; }
+    const s = candString(state.cand[i]); if (t.text !== s) t.text = s;
+    t.visible = true;
+  }
+
+  ovG.clear();
+  if (sel >= 0) {
+    const r = sel / 9 | 0, c = sel % 9;
+    ovG.lineStyle(3, 0x2563eb, 1).drawRect(c * CELL + 1.5, r * CELL + 1.5, CELL - 3, CELL - 3);
+  }
+
+  for (let n = 1; n <= 9; n++) {
+    let cnt = 0; for (let i = 0; i < 81; i++) if (p[i] === n) cnt++;
+    const done = cnt >= 9;
+    padBtns[n].disabled = done;
+    padBtns[n].alpha = done ? 0.45 : 1;
+    padBtns[n].label.tint = done ? 0xcbd5e1 : 0x1e293b;
+  }
+  updateStatus();
+}
+
+/* ==================== 游戏流程 ==================== */
+function startGame(p, sol) {
+  state.puzzle = p.slice();
+  state.solution = sol.slice();
+  state.initial = p.slice();
+  state.given = p.map(function (v) { return v !== 0; });
+  state.cand = new Array(81).fill(0);
+  state.hintCells = new Set();
+  state.mode = 'normal';
+  state.hints = 0; state.mistakes = 0;
+  state.elapsed = 0; state.running = true; state.finished = false;
+  const firstEmpty = state.puzzle.indexOf(0);
+  state.selected = firstEmpty >= 0 ? firstEmpty : 0;
+  refreshButtons();
+  render();
+}
+function newGame(diff) {
+  state.difficulty = diff;
+  Object.keys(diffBtns).forEach(function (k) {
+    const on = k === diff;
+    diffBtns[k].paint(on ? 0x2563eb : 0xffffff, on ? 0x2563eb : C.border, on ? 0xffffff : C.text);
+  });
+  state.running = false;
+  flash('正在生成「' + diff + '」题目，请稍候…');
+  updateStatus();
+  setTimeout(function () {
+    const g = makePuzzle(DIFF_CLUES[diff]);
+    startGame(g.puzzle, g.solution);
+  }, 40);
+}
+function resetPuzzle() {
+  if (state.mode === 'custom') return;
+  state.puzzle = state.initial.slice();
+  state.cand = new Array(81).fill(0);
+  state.hintCells = new Set();
+  state.finished = false;
+  state.running = state.puzzle.indexOf(0) >= 0;
+  state.selected = state.puzzle.indexOf(0);
+  render();
+}
+function enterCustom() {
+  backup = { p: state.puzzle.slice(), s: state.solution.slice() };
+  state.mode = 'custom';
+  state.puzzle = new Array(81).fill(0);
+  state.given = new Array(81).fill(false);
+  state.cand = new Array(81).fill(0);
+  state.selected = 40;
+  state.running = false;
+  refreshButtons(); render();
+}
+function exitCustom() {
+  if (backup) {
+    state.puzzle = backup.p.slice();
+    state.solution = backup.s.slice();
+    state.given = state.puzzle.map(function (v) { return v !== 0; });
+  }
+  backup = null;
+  state.mode = 'normal';
+  state.running = !state.finished && state.puzzle.indexOf(0) >= 0;
+  refreshButtons(); render();
+}
+function startCustomGame() {
+  const p = state.puzzle;
+  const count = p.filter(function (v) { return v !== 0; }).length;
+  if (count < 17) { flash('已知数字太少：至少 17 个（当前 ' + count + ' 个）'); return; }
+  const n = countSolutions(p, 2);
+  if (n === 0) { flash('该题目无解，请检查行/列/宫内是否有重复'); return; }
+  const sol = findSolution(p);
+  if (!sol) { flash('该题目无解'); return; }
+  backup = null;
+  startGame(p, sol);
+  if (n > 1) flash('注意：该题目存在多个解，提示采用其中一个');
+}
+function pastePuzzle() {
+  const sample = '530070000600195000098000060800060003400803001700020006060000280000419005000080079';
+  const s = prompt('请输入 81 个字符（0 或 . 表示空格），例如：\n' + sample, '');
+  if (s == null) return;
+  const digits = (s.match(/\d/g) || []).map(Number);
+  if (digits.length < 81) { flash('识别到 ' + digits.length + ' 个数字，不足 81 个'); return; }
+  state.puzzle = digits.slice(0, 81).map(function (d) { return d >= 1 && d <= 9 ? d : 0; });
+  state.selected = 40;
+  render();
+}
+
+/* ==================== 交互动作 ==================== */
+function pressNumber(n) {
+  if (overlayVisible) return;
+  const i = state.selected;
+  if (i < 0) return;
+  if (state.mode === 'custom') {
+    state.puzzle[i] = state.puzzle[i] === n ? 0 : n;
+    render(); return;
+  }
+  if (state.given[i]) { flash('这是题目给出的数字，不能修改'); return; }
+  if (state.mode === 'candidate') {
+    if (state.puzzle[i] !== 0) { flash('该格已填数字，先擦除才能标记候选'); return; }
+    state.cand[i] ^= (1 << n);
+    render(); return;
+  }
+  if (state.puzzle[i] === n) { state.puzzle[i] = 0; render(); return; }
+  state.puzzle[i] = n;
+  state.cand[i] = 0;
+  state.hintCells.delete(i);
+  removePeerCandidates(i, n);
+  if (n !== state.solution[i]) state.mistakes++;
+  render();
+  checkWin();
+}
+function eraseCell() {
+  if (overlayVisible) return;
+  const i = state.selected;
+  if (i < 0) return;
+  if (state.mode === 'custom') { state.puzzle[i] = 0; render(); return; }
+  if (state.given[i]) { flash('题目给出的数字不能擦除'); return; }
+  state.puzzle[i] = 0; state.cand[i] = 0; state.hintCells.delete(i);
+  render();
+}
+function removePeerCandidates(i, n) {
+  const r = i / 9 | 0, c = i % 9, br = r / 3 | 0, bc = c / 3 | 0;
+  const bit = ~(1 << n);
+  for (let k = 0; k < 81; k++) {
+    const rr = k / 9 | 0, cc = k % 9;
+    if (rr === r || cc === c || ((rr / 3 | 0) === br && (cc / 3 | 0) === bc)) state.cand[k] &= bit;
+  }
+}
+function toggleCandidate() {
+  if (state.mode === 'custom') return;
+  state.mode = state.mode === 'candidate' ? 'normal' : 'candidate';
+  refreshButtons(); render();
+}
+function autoCandidates() {
+  if (state.mode === 'custom') return;
+  for (let i = 0; i < 81; i++) {
+    if (state.puzzle[i]) { state.cand[i] = 0; continue; }
+    let mask = 0;
+    for (let n = 1; n <= 9; n++) if (canPlace(state.puzzle, i, n)) mask |= (1 << n);
+    state.cand[i] = mask;
+  }
+  flash('已为所有空格填充可能项');
+  render();
+}
+function hint() {
+  if (state.mode === 'custom') { flash('请先点击“开始游戏”'); return; }
+  if (state.finished) return;
+  let i = (state.selected >= 0 && state.puzzle[state.selected] === 0) ? state.selected : -1;
+  if (i < 0) {
+    const empties = [];
+    for (let k = 0; k < 81; k++) if (!state.puzzle[k]) empties.push(k);
+    if (!empties.length) return;
+    i = empties[Math.random() * empties.length | 0];
+  }
+  const n = state.solution[i];
+  state.puzzle[i] = n;
+  state.cand[i] = 0;
+  state.hintCells.add(i);
+  state.hints++;
+  state.selected = i;
+  removePeerCandidates(i, n);
+  render();
+  checkWin();
+}
+function checkWin() {
+  for (let i = 0; i < 81; i++) if (state.puzzle[i] !== state.solution[i]) return;
+  state.finished = true; state.running = false;
+  render();
+  showOverlay('🎉 恭喜完成！', [
+    '难度：' + state.difficulty,
+    '用时：' + fmt(state.elapsed),
+    '错误 ' + state.mistakes + ' 次 · 提示 ' + state.hints + ' 次'
+  ], '再来一局', function () { newGame(state.difficulty); });
+}
+
+/* ==================== 按钮行刷新 ==================== */
+function refreshButtons() {
+  if (state.mode === 'custom') {
+    buildRow(row1, 776, [
+      { label: '开始游戏', opts: { fill: 0x16a34a, border: 0x16a34a, color: 0xffffff, size: 16, onTap: startCustomGame } },
+      { label: '清空', opts: { onTap: function () { state.puzzle = new Array(81).fill(0); state.selected = 40; render(); } } },
+      { label: '粘贴文本', opts: { onTap: pastePuzzle } },
+      { label: '取消', opts: { onTap: exitCustom } }
+    ]);
+  } else {
+    const candOn = state.mode === 'candidate';
+    buildRow(row1, 776, [
+      { label: '提示', opts: { fill: 0xf59e0b, border: 0xf59e0b, color: 0xffffff, onTap: hint } },
+      {
+        label: candOn ? '候选模式 ✓' : '候选模式', opts: {
+          fill: candOn ? 0x2563eb : 0xffffff, border: candOn ? 0x2563eb : C.border,
+          color: candOn ? 0xffffff : C.text, onTap: toggleCandidate
+        }
+      },
+      { label: '自动候选', opts: { onTap: autoCandidates } },
+      { label: '清除候选', opts: { onTap: function () { state.cand = new Array(81).fill(0); render(); } } },
+      { label: '擦除', opts: { onTap: eraseCell } }
+    ]);
+  }
+  buildRow(row2, 830, [
+    { label: '新游戏', opts: { fill: 0x0ea5e9, border: 0x0ea5e9, color: 0xffffff, onTap: function () { newGame(state.difficulty); } } },
+    { label: '自定义题目', opts: { onTap: enterCustom } },
+    { label: '重置本题', opts: { onTap: resetPuzzle } },
+    { label: '帮助', opts: { onTap: showHelp } }
+  ]);
+}
+
+/* ==================== 键盘 ==================== */
+window.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape') { hideOverlay(); return; }
+  if (overlayVisible) return;
+  if (e.key >= '1' && e.key <= '9') { pressNumber(Number(e.key)); return; }
+  if (e.key === '0' || e.key === 'Backspace' || e.key === 'Delete') { eraseCell(); e.preventDefault(); return; }
+  if (e.key.indexOf('Arrow') === 0) {
+    e.preventDefault();
+    let i = state.selected < 0 ? 40 : state.selected;
+    let r = i / 9 | 0, c = i % 9;
+    if (e.key === 'ArrowUp') r = Math.max(0, r - 1);
+    if (e.key === 'ArrowDown') r = Math.min(8, r + 1);
+    if (e.key === 'ArrowLeft') c = Math.max(0, c - 1);
+    if (e.key === 'ArrowRight') c = Math.min(8, c + 1);
+    state.selected = r * 9 + c; render(); return;
+  }
+  if (e.key === 'c' || e.key === 'C') { toggleCandidate(); return; }
+  if (e.key === 'h' || e.key === 'H') { hint(); return; }
+});
+
+/* ==================== 启动 ==================== */
+newGame('中等');
+})();
+</script>
+</body>
+</html>
